@@ -1,0 +1,6 @@
+names:
+- sublot
+nc: 1
+path: e:\sublot-\dataset
+train: train/images
+val: val/images
