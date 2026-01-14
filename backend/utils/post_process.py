@@ -3,35 +3,54 @@ import numpy as np
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
 
-def detect_roads(image_np, brightness_threshold=180, edge_threshold1=50, edge_threshold2=150):
+def detect_roads(image_np, brightness_threshold=160, edge_threshold1=30, edge_threshold2=100):
     """
-    Detect roads using brightness and Canny edge detection.
-    Roads are typically light-colored with clear edges in agricultural satellite imagery.
+    Detect roads, paths, and 'street lines' in the image.
+    Agricultural paths are often neutral (grey/brown) or brighter than fields.
+    Uses a combination of color thresholding and Hough Line detection for straight paths.
     """
     # Convert to grayscale
-    if len(image_np.shape) == 3:
-        if image_np.shape[2] == 3: # RGB/BGR
-            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image_np[:,:,0]
-    else:
-        gray = image_np
-        
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, edge_threshold1, edge_threshold2)
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
     
-    # Detect bright pixels
+    # 1. Detect bright roads (concrete/paved)
     bright_mask = (gray > brightness_threshold).astype(np.uint8) * 255
     
-    # Combine edges with brightness
-    kernel = np.ones((3, 3), np.uint8)
-    edges_dilated = cv2.dilate(edges, kernel, iterations=2)
-    road_mask = cv2.bitwise_and(bright_mask, edges_dilated)
+    # 2. Detect neutral paths (dirt roads often have low saturation)
+    hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    path_mask = ((saturation < 40) & (gray > 80)).astype(np.uint8) * 255
     
-    # Final dilation to ensure road coverage
-    road_mask = cv2.dilate(road_mask, kernel, iterations=1)
+    # 3. Use Edge detection
+    edges = cv2.Canny(gray, edge_threshold1, edge_threshold2)
+    kernel = np.ones((5, 5), np.uint8)
     
-    return road_mask > 0
+    # 4. Hough Line Detection for 'Street Lines' (LESS AGGRESSIVE)
+    # Agricultural fields are bounded by very straight paths.
+    street_mask = np.zeros_like(gray)
+    # Increased threshold to 120 (from 80) and minLineLength to 100 (from 50) for fewer false positives
+    # Reduced line thickness to 3 (from 5) to not remove too much field area
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=120, minLineLength=100, maxLineGap=20)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            # Draw lines with less thickness to avoid removing field content
+            cv2.line(street_mask, (x1, y1), (x2, y2), 255, 3)
+    
+    # Combined Road/Street Mask - Make it less aggressive
+    # Only use bright roads and the Hough lines, skip the low-saturation mask which can be too broad
+    combined_road = cv2.bitwise_or(bright_mask, street_mask)
+    
+    # Don't dilate edges as much to preserve field boundaries
+    edges_dilated = cv2.dilate(edges, np.ones((2,2), np.uint8), iterations=1)
+    
+    # Only add edges if they coincide with detected roads
+    edges_on_roads = cv2.bitwise_and(edges_dilated, combined_road)
+    combined_road = cv2.bitwise_or(combined_road, edges_on_roads)
+    
+    # Less aggressive morphology
+    combined_road = cv2.morphologyEx(combined_road, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+    
+    return combined_road > 0
 
 def subtract_roads(mask_np, road_mask, min_component_area=100):
     """
@@ -95,6 +114,20 @@ def is_on_border(mask_np):
         mask_np[:, 0].any() or mask_np[:, -1].any()
     )
 
+def is_in_corner(mask_np, corner_margin=0.15):
+    """Check if mask is in a corner region (within 15% of edges from corners)."""
+    h, w = mask_np.shape
+    margin_h = int(h * corner_margin)
+    margin_w = int(w * corner_margin)
+    
+    # Check if mask has pixels in any corner region
+    top_left = mask_np[:margin_h, :margin_w].any()
+    top_right = mask_np[:margin_h, w-margin_w:].any()
+    bottom_left = mask_np[h-margin_h:, :margin_w].any()
+    bottom_right = mask_np[h-margin_h:, w-margin_w:].any()
+    
+    return top_left or top_right or bottom_left or bottom_right
+
 def get_tiles_metadata(img_w, img_h, tile_size=640, overlap=0.25):
     """Calculate tile coordinates with overlap."""
     tiles = []
@@ -151,6 +184,37 @@ def is_rectangular(poly, threshold=0.3):
     poly_area = cv2.contourArea(poly)
     rectangularity = poly_area / bbox_area
     return rectangularity >= threshold
+
+
+
+
+def refine_mask_to_content(mask_np, image_np):
+    """
+    Refines a mask to stay 'inside' the border of the field content.
+    Uses local color and edge data to prune pixels that look like dirt/roads.
+    """
+    if mask_np.sum() < 100:
+        return mask_np
+        
+    # Create a mask of the content
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    kernel = np.ones((3,3), np.uint8)
+    edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+    
+    # The refined mask: Keep original mask pixels that are NOT on a strong edge 
+    # (edges often define the boundary of the field)
+    refined = mask_np.copy()
+    refined[edges_dilated > 0] = 0
+    
+    # Clean up shards
+    refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, kernel)
+    
+    # If we lost too much, fall back to a slightly eroded version of original
+    if refined.sum() < mask_np.sum() * 0.5:
+        return cv2.erode(mask_np, kernel, iterations=1)
+        
+    return refined
 
 def non_max_suppression_shapely(candidates, overlap_thresh=0.3):
     """

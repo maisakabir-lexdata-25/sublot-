@@ -1,24 +1,34 @@
 import streamlit as st
+import torch
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.transforms import functional as F
 from ultralytics import YOLO
 import cv2
 import numpy as np
 from PIL import Image
 import io
-import torch
+import os
+import sys
 
 # Fix for PyTorch 2.6+ security restriction on model loading
 try:
     from ultralytics.nn.tasks import SegmentationModel, DetectionModel
     import torch.nn as nn
-    import sys
-    import os
     # Add project root to sys.path to allow importing from backend
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from backend.utils import post_process
     from backend.utils.post_process import (
         detect_roads, subtract_roads, get_tiles_metadata, 
         is_centroid_in_center, split_merged_mask_watershed, 
-        is_rectangular, non_max_suppression_shapely, is_on_border
+        is_rectangular, non_max_suppression_shapely, is_on_border,
+        refine_mask_to_content, is_in_corner
     )
+    # Force reload to get latest changes
+    import importlib
+    importlib.reload(post_process)
+    from backend.utils.post_process import is_in_corner  # Re-import after reload
     
     # List of classes to allow for secure loading
     safe_classes = [
@@ -44,352 +54,524 @@ try:
 except Exception:
     pass
 
+# -------------------------------------------------------------------
+# Page Config & Styles
+# -------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Sublot Intelligence Suite",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # Custom CSS for Premium Look
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Orbitron:wght@500;700&display=swap');
     
     html, body, [class*="css"] {
         font-family: 'Inter', sans-serif;
     }
     .stApp {
-        background-color: #12141a; /* Deeper slate but cleaner contrast */
+        background-color: #0e1117;
     }
     .main {
-        background: linear-gradient(135deg, #161a21 0%, #12141a 100%);
+        background: radial-gradient(circle at top right, #1a1c24, #0e1117);
         padding: 2rem;
     }
     .stMetric {
-        background: rgba(255, 255, 255, 0.08);
-        padding: 15px;
-        border-radius: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.05);
+        padding: 20px;
+        border-radius: 15px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
         backdrop-filter: blur(10px);
-        border-left: 4px solid #4CAF50;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
     }
-    .stSidebar {
-        background-color: #1c2128 !important; /* Lighter sidebar for better text visibility */
-        border-right: 1px solid rgba(255, 255, 255, 0.1);
+    h1 {
+        font-family: 'Orbitron', sans-serif;
+        background: linear-gradient(90deg, #4facfe 0%, #00f2fe 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 700;
+        letter-spacing: 2px;
     }
-    /* Improve text contrast */
-    h1, h2, h3, p, label, .stMarkdown {
-        color: #e6edf3 !important;
+    .stButton>button {
+        background: linear-gradient(90deg, #4facfe 0%, #00f2fe 100%) !important;
+        border: none !important;
+        color: white !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        transition: all 0.3s ease !important;
     }
-    /* Glassmorphism card effect */
-    .css-1r6slb0, .css-12oz5g7 {
-        background: rgba(255, 255, 255, 0.07);
-        border: 1px solid rgba(255, 255, 255, 0.15);
+    .stButton>button:hover {
+        transform: scale(1.02);
+        box-shadow: 0 5px 15px rgba(79, 172, 254, 0.4);
+    }
+    .stSelectbox, .stSlider {
+        background: rgba(255, 255, 255, 0.02);
         border-radius: 10px;
+        padding: 5px;
+    }
+    .sidebar .sidebar-content {
+        background-color: #161b22;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Title and description
+# -------------------------------------------------------------------
+# Model Helper Functions
+# -------------------------------------------------------------------
+
+def get_mask_rcnn_model(num_classes):
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=None)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden_layer = 256
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden_layer, num_classes)
+    return model
+
+@st.cache_resource
+def load_yolo(path):
+    if not os.path.exists(path): return None
+    model = YOLO(path)
+    if model.task != 'segment': return None
+    return model
+
+@st.cache_resource
+def load_mrcnn(path, device):
+    if not os.path.exists(path): return None
+    model = get_mask_rcnn_model(2)
+    try:
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.to(device)
+        model.eval()
+        return model
+    except:
+        return None
+
+def random_color():
+    return tuple(np.random.randint(50, 255, 3).tolist())
+
+# -------------------------------------------------------------------
+# Main App Logic
+# -------------------------------------------------------------------
+
 st.title("🌿 Sublot Intelligence Pro")
-st.markdown("### Precision Instance Segmentation for Agricultural Fields")
+st.markdown("### Advanced Agricultural Instance Segmentation Suite")
 
-import os
+# Sidebar Configuration
+st.sidebar.header("🕹️ Engine Control")
+engine_choice = st.sidebar.radio(
+    "Select Model Engine",
+    ["YOLOv11-SEG", "Mask R-CNN", "Ultimate Hybrid"],
+    index=1, # Default to Mask R-CNN as user is using it
+    help="Choose the detection backbone for your analysis."
+)
 
-# Sidebar for model upload
-st.sidebar.header("📁 Model Configuration")
+device_choice = st.sidebar.selectbox("Compute Device", ["cuda", "cpu"], index=0 if torch.cuda.is_available() else 1)
+DEVICE = torch.device(device_choice)
 
-# Check common locations for the model
-default_path = "backend/models/yolov11_sublot/yolov11m_final/weights/best.pt"
-if not os.path.exists(default_path):
-    # Try alternate location if running from within frontend/
-    alt_path = "../backend/models/yolov11_sublot/yolov11m_final/weights/best.pt"
-    if os.path.exists(alt_path):
-        default_path = alt_path
+st.sidebar.markdown("---")
+st.sidebar.header("📁 Configuration")
 
-model_path = st.sidebar.text_input("Model Path", value=default_path)
-
-with st.sidebar.expander("🛠️ Advanced Settings", expanded=True):
-    conf_threshold = st.slider("Confidence", 0.01, 1.0, 0.10, help="Lower this if sublots are not being detected.")
-    iou_threshold = st.slider("IOU Threshold", 0.1, 0.9, 0.45, help="Standard NMS threshold.")
-    min_area = st.slider("Min Area (px)", 10, 10000, 100)
-    filter_border = st.checkbox("Only Complete Subplots", value=True, help="Remove sublots touching the image edge.")
-    enforce_roads = st.checkbox("Enforce Road Boundaries", value=True, help="Detect roads and use them to split merged agricultural fields.")
-    use_tiling = st.checkbox("Use Tiled Inference", value=True, help="Process large images in overlapping tiles to avoid boundary artifacts.")
-    disable_geometry = st.checkbox("Disable Shape Validation", value=True, help="Keep all shapes regardless of how rectangular they are.")
-    split_merged = st.checkbox("Split Merged Sublots (Watershed)", value=True, help="Use distance transform to break giant merged fields into individual subplots.")
-    show_raw = st.checkbox("Show Raw YOLO Detections", value=False, help="Debug mode: show everything the model sees.")
-
-# Initialize session state for model
-if 'model' not in st.session_state:
-    st.session_state.model = None
-if 'model_loaded' not in st.session_state:
-    st.session_state.model_loaded = False
-
-# Auto-load model on startup
-if not st.session_state.model_loaded:
-    try:
-        if os.path.exists(default_path):
-            st.session_state.model = YOLO(default_path)
-            if st.session_state.model.task == 'segment':
-                st.session_state.model_loaded = True
-    except Exception:
-        pass
-
-# Load model button (manual override)
-if st.sidebar.button("Load/Reload Model"):
-    try:
-        with st.spinner("Loading YOLOv11-SEG model..."):
-            st.session_state.model = YOLO(model_path)
-            # Verify it's a segmentation model
-            if st.session_state.model.task != 'segment':
-                st.sidebar.error(f"❌ Error: This is a '{st.session_state.model.task}' model, not a segmentation model!")
-                st.session_state.model_loaded = False
-            else:
-                st.session_state.model_loaded = True
-                st.sidebar.success("✅ YOLOv11-SEG Model loaded!")
-    except Exception as e:
-        st.sidebar.error(f"❌ Error loading model: {str(e)}")
-        st.session_state.model_loaded = False
-
-# Main content area
-if st.session_state.model_loaded:
-    st.success("🎯 Model is ready! Upload an image to detect sublots.")
-    
-    # Image upload
-    uploaded_image = st.file_uploader(
-        "Upload Field Image",
-        type=["jpg", "png", "jpeg", "bmp", "tiff"],
-        help="Upload an image of the field to detect sublots"
-    )
-    
-    if uploaded_image:
-        # Display original image
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📷 Original Image")
-            image = Image.open(uploaded_image).convert("RGB")
-            st.image(image, width="stretch")
-        
-        # Analysis execution
-        # Auto-run if image is uploaded (Activation On)
-        if True: # Always process if we reach here and have an image
-            with st.spinner("Processing image with YOLOv11-SEG..."):
-                try:
-                    # Run YOLO inference Using GPU (RTX 4060)
-                    results = st.session_state.model.predict(
-                        source=image,
-                        conf=conf_threshold,
-                        iou=iou_threshold,
-                        verbose=False,
-                        device=0 # Using GPU 0
-                    )[0]
-                    
-                    from shapely.geometry import Polygon
-                    from shapely.validation import make_valid
-                    
-                    # Store candidates with confidence
-                    candidates = []
-                    
-                    if results.masks is not None:
-                        h_img, w_img = image.size[::-1]
-                        
-                        # Get boxes for confidence scores
-                        boxes = results.boxes
-                        
-                        # (Functions removed - now imported from backend.utils.post_process)
-
-                        # (Function removed - now imported)
-
-                        raw_results = []
-                        img_np = np.array(image)
-                        h_img, w_img = img_np.shape[:2]
-
-                        if use_tiling:
-                            tiles_meta = get_tiles_metadata(w_img, h_img)
-                            for tx, ty, tw, th in tiles_meta:
-                                tile_img = img_np[ty:ty+th, tx:tx+tw]
-                                t_res = st.session_state.model.predict(
-                                    source=tile_img, conf=conf_threshold, iou=iou_threshold, 
-                                    verbose=False, device=0
-                               )[0]
-                                if t_res.masks is not None:
-                                    for m, b, p in zip(t_res.masks.data, t_res.boxes.conf, t_res.masks.xy):
-                                        global_poly = p + np.array([tx, ty])
-                                        if is_centroid_in_center(global_poly, (tx, ty, tw, th), 0.25, (w_img, h_img)):
-                                            raw_results.append({'mask': m, 'conf': b.item(), 'offset': (tx, ty), 'size': (tw, th)})
-                        else:
-                            res = st.session_state.model.predict(
-                                source=img_np, conf=conf_threshold, iou=iou_threshold, 
-                                verbose=False, device=0
-                            )[0]
-                            if res.masks is not None:
-                                for m, b in zip(res.masks.data, res.boxes.conf):
-                                    raw_results.append({'mask': m, 'conf': b.item(), 'offset': (0, 0), 'size': (w_img, h_img)})
-
-                        road_mask = detect_roads(img_np) if enforce_roads else None
-
-                        for item in raw_results:
-                            mask_tensor = item['mask']
-                            tx, ty = item['offset']
-                            tw, th = item['size']
-                            conf = item['conf']
-                            
-                            # Convert to numpy and resize to tile dimensions
-                            mask_np = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
-                            if mask_np.shape != (th, tw):
-                                mask_np = cv2.resize(mask_np, (tw, th))
-                            
-                            # Rule 1: Kill boundary predictions
-                            if filter_border:
-                                is_complete = not (
-                                    mask_np[0, :].any() or mask_np[-1, :].any() or 
-                                    mask_np[:, 0].any() or mask_np[:, -1].any()
-                                )
-                                if not is_complete:
-                                    continue
-                            
-                            # Rule 3: Enforce Road Boundaries
-                            if enforce_roads and road_mask is not None:
-                                # Get full size mask for road subtraction
-                                full_mask = np.zeros((h_img, w_img), dtype=np.uint8)
-                                mh, mw = mask_np.shape
-                                full_mask[ty:ty+mh, tx:tx+mw] = mask_np
-                                
-                                field_masks = subtract_roads(full_mask, road_mask)
-                                mask_list = [fm[ty:ty+mh, tx:tx+mw] for fm in field_masks]
-                            else:
-                                mask_list = [mask_np]
-
-                            for m in mask_list:
-                                # Rule 2: Split merged masks
-                                if split_merged:
-                                    sub_polys = split_merged_mask_watershed(m)
-                                    for sp in sub_polys:
-                                        global_sp = sp + np.array([tx, ty])
-                                        if cv2.contourArea(global_sp) >= min_area:
-                                            if disable_geometry or is_rectangular(global_sp):
-                                                candidates.append({'poly': global_sp, 'conf': conf})
-                                else:
-                                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                    for cnt in contours:
-                                        poly = cnt.reshape(-1, 2) + np.array([tx, ty])
-                                        if cv2.contourArea(poly) >= min_area:
-                                            if disable_geometry or is_rectangular(poly):
-                                                candidates.append({'poly': poly, 'conf': conf})
-                    
-                    # Sort candidates by confidence (highest first) to prioritize better detections
-                    candidates.sort(key=lambda x: x['conf'], reverse=True)
-                    
-                    # Non-overlapping logic using Shapely
-                    polygons = []
-                    occupied_union = Polygon()
-                    
-                    for cand in candidates:
-                        poly_np = cand['poly']
-                        
-                        # Create Shapely polygon (must have >= 3 points)
-                        if len(poly_np) < 3:
-                            continue
-                            
-                        try:
-                            shapely_poly = Polygon(poly_np)
-                            if not shapely_poly.is_valid:
-                                shapely_poly = make_valid(shapely_poly)
-                        except Exception:
-                            continue
-                            
-                    if not show_raw:
-                        candidates = non_max_suppression_shapely(candidates, overlap_thresh=0.3)
-                        polygons = [c['poly'] for c in candidates]
-                    else:
-                        polygons = [c['poly'] for c in candidates]
-                    
-                    num_sublots = len(polygons)
-                    
-                    # Display results
-                    with col2:
-                        st.subheader("🎯 Identification Results")
-                        
-                        # Add explanation of calculation
-                        with st.expander("ℹ️ How was this calculated?"):
-                            st.write(f"""
-                            **Calculation Logic:**
-                            1. **Detection**: YOLOv11 detected **{len(candidates)}** raw potential sublots.
-                            2. **Filtering**: We removed objects smaller than {min_area}px. {"(Border filter active)" if filter_border else "(Border filter inactive)"}
-                            3. **Duplicate Suppression**: We prioritized high-confidence detections. If a detection overlapped significantly with a better one, it was discarded. Otherwise, the **full original boundary** was preserved.
-                            4. **Final Count**: **{num_sublots}** unique sublots identified.
-                            """)
-
-                        if num_sublots > 0:
-                            # Create visualization
-                            img_np = np.array(image)
-                            overlay = img_np.copy()
-                            
-                            # Premium color palette
-                            colors = [
-                                (76, 175, 80), (139, 195, 74), (205, 220, 57),
-                                (255, 235, 59), (255, 193, 7), (255, 152, 0),
-                                (255, 87, 34), (233, 30, 99), (156, 39, 176),
-                                (103, 58, 183), (63, 81, 181), (33, 150, 243)
-                            ]
-                            
-                            for idx, poly in enumerate(polygons):
-                                color = colors[idx % len(colors)]
-                                # BGR conversion for OpenCV
-                                color_bgr = (color[2], color[1], color[0])
-                                
-                                # Draw filled polygon with transparency
-                                cv2.fillPoly(overlay, [poly], color_bgr)
-                                # Draw glowing border
-                                cv2.polylines(img_np, [poly], True, (255, 255, 255), 3)
-                                cv2.polylines(img_np, [poly], True, color_bgr, 1)
-                            
-                            # Blend overlay with dynamic opacity
-                            cv2.addWeighted(overlay, 0.5, img_np, 0.5, 0, img_np)
-                            
-                            st.image(img_np, width="stretch", caption=f"Identified {num_sublots} instances")
-                            st.success(f"✅ **{num_sublots} Separate Sublots Identified**")
-                            
-                            # Metrics
-                            metric_col1, metric_col2 = st.columns(2)
-                            with metric_col1:
-                                st.metric("Total sublots", num_sublots)
-                            with metric_col2:
-                                total_area = sum(cv2.contourArea(p) for p in polygons)
-                                st.metric("Total Area (px)", f"{int(total_area):,}")
-                            
-                            # Download
-                            buf = io.BytesIO()
-                            Image.fromarray(img_np).save(buf, format="PNG")
-                            st.download_button(
-                                label="⬇️ Download YOLO Result",
-                                data=buf.getvalue(),
-                                file_name="yolo_result.png",
-                                mime="image/png",
-                                width="stretch"
-                            )
-                        else:
-                            st.image(image, width="stretch")
-                            st.warning("⚠️ No sublots identified in this image.")
-                            
-                except Exception as e:
-                    st.error(f"❌ Analysis error: {str(e)}")
-
-    else:
-        st.info("👆 Please upload an image to begin")
-
+# Dynamic Paths based on Engine
+if engine_choice == "YOLOv11-SEG":
+    DEFAULT_YOLO_PATH = "backend/models/yolov11_sublot/yolov11m_final/weights/best.pt"
+    model_path = st.sidebar.text_input("YOLO Weights (.pt)", value=DEFAULT_YOLO_PATH)
+elif engine_choice == "Mask R-CNN":
+    DEFAULT_MRCNN_PATH = "mask_rcnn_sublot_20e.pth"
+    model_path = st.sidebar.text_input("Mask R-CNN Weights (.pth)", value=DEFAULT_MRCNN_PATH)
 else:
-    st.warning("⚠️ Please load your trained YOLOv11-SEG model to begin")
-    st.markdown("""
-    ### 📝 YOLOv11-SEG Identification Workflow:
-    1. **Train**: Run `python train.py` to train your model.
-    2. **Load**: Enter the path to your model (.pt file) in the sidebar.
-    3. **Detect**: Upload an image to identify sublot polygons.
+    # Hybrid Mode
+    DEFAULT_YOLO_PATH = "ultimate_hybrid/yolo_stage/weights/best.pt"
+    DEFAULT_MRCNN_PATH = "ultimate_hybrid_refiner.pth"
+    yolo_p = st.sidebar.text_input("YOLO Stage Path", value=DEFAULT_YOLO_PATH)
+    mrcnn_p = st.sidebar.text_input("Refiner MRCNN Path", value=DEFAULT_MRCNN_PATH)
+    model_path = yolo_p # Just for status check
+
+# Advanced Settings
+with st.sidebar.expander("🛠️ Advanced Settings", expanded=True):
+    conf_threshold = st.slider("Global Sensitivity", 0.01, 1.0, 0.10)
     
-    *Note: YOLOv11-SEG provides native instance segmentation with separate polygons.*
-    """)
+    use_tiling = st.checkbox("Enable Intelligent Tiling", value=True)
+    use_watershed = st.checkbox("✨ Precision Watershed Snapping", value=True, help="Snaps boundaries exactly to visual edges between fields.")
+    
+    min_area = st.slider("Min Area (px)", 10, 5000, 120)
+    filter_border = st.checkbox("Strict Edge Cleanup", value=False)
+    
+    detect_surrounding = st.checkbox("🌐 Detect Surrounding Areas", value=True, help="Ultra-aggressive detection for edge and border sublots.")
+    
+    show_street_debug = st.checkbox("🔍 Show Detected Street Lines", value=False, help="Visualize the detected roads and paths for debugging.")
+    show_comparison = st.checkbox("🔄 Show Before/After Comparison", value=False, help="Compare detection with and without street line suppression.")
+
+    
+    st.markdown("---")
+    st.markdown("### 🎨 Annotation Style")
+    use_street_suppression = st.checkbox("🛣️ Street Line Suppression", value=False, help="Uses detected roads and straight field lines to clip and bound sublots.")
+    box_scale = st.slider("Boundary Offset", 0.8, 1.1, 1.0)
+    smooth_poly = st.slider("Boundary Smoothing", 0, 10, 3, help="Smooths out jagged edges for a professional look.")
+    fill_opacity = st.slider("Transparency", 0.0, 1.0, 0.3)
+    border_px = st.slider("Border Thickness", 1, 10, 2)
+
+# Load Model
+model = None
+with st.spinner(f"Waking up {engine_choice} engine..."):
+    if engine_choice == "YOLOv11-SEG":
+        model = load_yolo(model_path)
+    elif engine_choice == "Mask R-CNN":
+        model = load_mrcnn(model_path, DEVICE)
+    elif engine_choice == "Ultimate Hybrid":
+        yolo_h = load_yolo(yolo_p)
+        mrcnn_h = load_mrcnn(mrcnn_p, DEVICE)
+        model = (yolo_h, mrcnn_h) if yolo_h and mrcnn_h else None
+
+if model is None:
+    st.error(f"❌ Failed to load {engine_choice} weights. Please verify the path.")
+else:
+    st.sidebar.success(f"✅ {engine_choice} Active")
+
+# Main Interface
+uploaded_file = st.file_uploader("📤 Upload Satellite/Field Imagery", type=['jpg', 'jpeg', 'png', 'tiff'])
+
+if uploaded_file is not None:
+    image = Image.open(uploaded_file).convert("RGB")
+    img_np = np.array(image)
+    h_img, w_img = img_np.shape[:2]
+    
+    # --- ENGINE 0: PRE-PROCESSING (Contrast Enhancement) ---
+    enable_clahe = st.sidebar.checkbox("✨ Enhance Edge Contrast (CLAHE)", value=False, help="Improves visibility in faint/shadowed surroundings.")
+    force_unified = st.sidebar.toggle("🧬 Force Unified Fields", value=True, help="Prevents sublots from being split into many pieces by internal lines (Good for purple marks).")
+    if enable_clahe:
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl,a,b))
+        img_np_proc = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+    else:
+        img_np_proc = img_np.copy()
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📷 Original Input")
+        st.image(image, use_container_width=True)
+    
+    with st.spinner(f"Analyzing {engine_choice} for surroundings..."):
+        
+        # Function to run detection pipeline
+        def run_detection_pipeline(apply_street_suppression):
+            """Run the full detection pipeline with or without street line suppression"""
+            candidates_local = []
+            
+            # Tiled Inference Strategy (Maximum overlap for complete edge field coverage)
+            if use_tiling:
+                tiles_meta = get_tiles_metadata(w_img, h_img, tile_size=640, overlap=0.45)
+            else:
+                tiles_meta = [(0, 0, w_img, h_img)]
+
+            # Process image for surrounding area detection
+            # Add padding if surrounding detection is enabled to catch edge fields better
+            if detect_surrounding:
+                # Add 48px padding on all sides for better corner/edge context
+                img_np_padded = cv2.copyMakeBorder(img_np_proc, 48, 48, 48, 48, cv2.BORDER_REFLECT)
+                pad_offset = 48
+            else:
+                img_np_padded = img_np_proc
+                pad_offset = 0
+
+            for tx, ty, tw, th in tiles_meta:
+                # Adjust tile coordinates for padding
+                tile_img = img_np_padded[ty+pad_offset:ty+th+pad_offset, tx+pad_offset:tx+tw+pad_offset]
+                t_image = Image.fromarray(tile_img)
+                
+                # --- MODEL INFERENCE ---
+                if "YOLO" in engine_choice or engine_choice == "Ultimate Hybrid":
+                    y_mod = model[0] if engine_choice == "Ultimate Hybrid" else model
+                    y_res = y_mod.predict(source=t_image, conf=conf_threshold, verbose=False)[0]
+                    if y_res.masks is not None:
+                        for idx, p in enumerate(y_res.masks.xy):
+                            poly = (np.array(p, dtype=np.int32) + np.array([tx, ty])).astype(np.int32)
+                            candidates_local.append({'poly': poly, 'conf': y_res.boxes.conf[idx].item()})
+
+                if "Mask R-CNN" in engine_choice or engine_choice == "Ultimate Hybrid":
+                    m_mod = model[1] if engine_choice == "Ultimate Hybrid" else model
+                    t_tensor = F.to_tensor(t_image).unsqueeze(0).to(DEVICE)
+                    with torch.no_grad():
+                        preds = m_mod(t_tensor)
+                    
+                    p_masks = preds[0]['masks'].cpu().numpy()
+                    p_scores = preds[0]['scores'].cpu().numpy()
+                    for i in range(len(p_scores)):
+                        if p_scores[i] < conf_threshold: continue
+                        mask_tile = (p_masks[i, 0] > 0.5).astype(np.uint8)
+                        cnts, _ = cv2.findContours(mask_tile, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for cnt in cnts:
+                            poly = (cnt.reshape(-1, 2) + np.array([tx, ty])).astype(np.int32)
+                            candidates_local.append({'poly': poly, 'conf': p_scores[i]})
+
+            # --- PHASE 2: GLOBAL ORCHESTRATION ---
+            # 1. High-precision hard NMS using Shapely to remove clear duplicates
+            # Use a slightly higher threshold (0.5) to avoid merging adjacent fields
+            candidates_local = non_max_suppression_shapely(candidates_local, overlap_thresh=0.5)
+            
+            candidates_local.sort(key=lambda x: x['conf'], reverse=True)
+            polygons_local = []
+            occupied_mask_local = np.zeros((h_img, w_img), dtype=np.uint8)
+            
+            # Global Edge Knowledge
+            gray = cv2.cvtColor(img_np_proc, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 60, 150)
+            edge_kernel = np.ones((3,3), np.uint8)
+            edges_dilated = cv2.dilate(edges, edge_kernel, iterations=1)
+            
+            # Pre-detect Roads and Street Lines if enabled
+            road_mask_local = detect_roads(img_np_proc) if apply_street_suppression else np.zeros((h_img, w_img), dtype=bool)
+
+            for cand in candidates_local:
+                # 2. SHAPE-BASED GHOSTING FILTER (Solve Red Marks)
+                # Detect long, thin "ribbon" artifacts that overlap real fields
+                p_area = cv2.contourArea(cand['poly'])
+                p_perimeter = cv2.arcLength(cand['poly'], True)
+                if p_perimeter == 0: continue
+                compactness = (4 * np.pi * p_area) / (p_perimeter ** 2)
+                
+                # If sublot is EXTREMELY thin/jagged (ghosting), drop it if it overlaps a lot
+                # Lowered from 0.15 to 0.10 to be more conservative - only filter true artifacts
+                is_ghost_candidate = compactness < 0.10
+
+                temp_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                cv2.fillPoly(temp_mask, [cand['poly']], 255)
+                
+                # ROAD/STREET SUBTRACTION - Apply the street line logic
+                if apply_street_suppression:
+                    temp_mask[road_mask_local] = 0
+                
+                # ZERO OVERLAP SUBTRACTION
+                intersection = cv2.bitwise_and(temp_mask, occupied_mask_local)
+                overlap_area = cv2.countNonZero(intersection)
+                
+                # If a ghost candidate overlaps significantly with already detected fields, IGNORE IT
+                # BUT: Always preserve border/corner fields even if they look like ghosts
+                if is_ghost_candidate and (overlap_area > p_area * 0.2):
+                    # Check if this is a border or corner field - if so, DON'T filter it
+                    temp_check = np.zeros((h_img, w_img), dtype=np.uint8)
+                    cv2.fillPoly(temp_check, [cand['poly']], 255)
+                    is_border_check = is_on_border(temp_check)
+                    is_corner_check = is_in_corner(temp_check) if detect_surrounding else False
+                    if not (is_border_check or is_corner_check):
+                        continue
+
+                temp_mask[occupied_mask_local > 0] = 0
+                
+                # Check if this is a border or corner field
+                is_border_field = is_on_border(temp_mask)
+                is_corner_field = is_in_corner(temp_mask) if detect_surrounding else False
+                
+                # MULTI-TIER area check: Corner > Border > Interior
+                # Apply progressively aggressive thresholds based on location
+                if is_corner_field:
+                    # EXTREME mode for corners: 3% threshold (hardest to detect)
+                    c_min_area = min_area * 0.03
+                elif is_border_field:
+                    if detect_surrounding:
+                        # ULTRA mode for borders: 5% threshold
+                        c_min_area = min_area * 0.05
+                    else:
+                        # Normal border mode: 10% threshold
+                        c_min_area = min_area * 0.1
+                else:
+                    # Standard interior threshold
+                    c_min_area = min_area
+                    
+                if cv2.countNonZero(temp_mask) < c_min_area: continue
+                
+                if force_unified:
+                    # Keep fields whole (Solve purple/blue marks AND striped/textured fields)
+                    # First, close internal gaps caused by stripes or texture
+                    closing_kernel = np.ones((7,7), np.uint8)
+                    temp_mask_closed = cv2.morphologyEx(temp_mask, cv2.MORPH_CLOSE, closing_kernel, iterations=2)
+                    
+                    # Then dilate slightly to bridge thin gaps between nearby regions
+                    bridge_kernel = np.ones((5,5), np.uint8)
+                    temp_mask_closed = cv2.dilate(temp_mask_closed, bridge_kernel, iterations=1)
+                    
+                    # Now extract unified contours
+                    cnts, _ = cv2.findContours(temp_mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    for cnt in cnts:
+                        if cv2.contourArea(cnt) >= c_min_area:
+                            polygons_local.append(cnt.reshape(-1, 2))
+                            cv2.fillPoly(occupied_mask_local, [cnt], 255)
+                else:
+                    # Precision Watershed logic for 'Perfect' boundaries
+                    if use_watershed:
+                        # Create marker for watershed
+                        # Background is already marked as 'occupied'
+                        # We create local markers inside the temp_mask
+                        dist_transform = cv2.distanceTransform(temp_mask, cv2.DIST_L2, 5)
+                        _, sure_fg = cv2.threshold(dist_transform, 0.3*dist_transform.max(), 255, 0)
+                        sure_fg = np.uint8(sure_fg)
+                        
+                        cnts, _ = cv2.findContours(sure_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for cnt in cnts:
+                            if cv2.contourArea(cnt) >= c_min_area:
+                                polygons_local.append(cnt.reshape(-1, 2))
+                                cv2.fillPoly(occupied_mask_local, [cnt], 255)
+                    else:
+                        # Standard Splitting logic
+                        split_mask = temp_mask.copy()
+                        split_mask[edges_dilated > 0] = 0
+                        num_labels, labels = cv2.connectedComponents(split_mask)
+                        for label in range(1, num_labels):
+                            comp = (labels == label).astype(np.uint8) * 255
+                            if cv2.countNonZero(comp) >= c_min_area:
+                                comp = cv2.dilate(comp, edge_kernel, iterations=1)
+                                comp = cv2.bitwise_and(comp, temp_mask)
+                                cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                for cnt in cnts:
+                                    if cv2.contourArea(cnt) >= c_min_area:
+                                        polygons_local.append(cnt.reshape(-1, 2))
+                                        cv2.fillPoly(occupied_mask_local, [cnt], 255)
+
+            # Smart Border logic
+            if filter_border:
+                new_f_polys = []
+                for p in polygons_local:
+                    area = cv2.contourArea(p)
+                    if area > 300: new_f_polys.append(p)
+                    else:
+                        on_e = False
+                        for pt in p:
+                            if pt[0] <= 1 or pt[1] <= 1 or pt[0] >= w_img-1 or pt[1] >= h_img-1:
+                                on_e = True; break
+                        if not on_e: new_f_polys.append(p)
+                polygons_local = new_f_polys
+            
+            return polygons_local, road_mask_local
+        
+        # Run detection with current settings
+        polygons, road_mask = run_detection_pipeline(use_street_suppression)
+        
+        # If comparison mode is enabled, also run without street suppression
+        if show_comparison:
+            polygons_before, _ = run_detection_pipeline(False)
+        
+
+    with col2:
+        st.subheader(f"🎯 Detection Result ({len(polygons)})")
+        
+        if polygons:
+            canvas = img_np.copy()
+            overlay = img_np.copy()
+            colors = [(79, 172, 254), (0, 242, 254), (74, 194, 154), (180, 236, 81), (247, 249, 151), (238, 156, 167)]
+            
+            for idx, poly in enumerate(polygons):
+                color = colors[idx % len(colors)]
+                color_bgr = (color[2], color[1], color[0])
+                
+                # REFINEMENT & SMOOTHING
+                if smooth_poly > 0:
+                    epsilon = 0.0005 * smooth_poly * cv2.arcLength(poly, True)
+                    poly = cv2.approxPolyDP(poly, epsilon, True)
+                
+                # We no longer use convexHull here because it causes overlaps on adjacent fields.
+                # Instead, we use the smoothed polygon directly.
+                target_poly = poly
+                
+                M = cv2.moments(target_poly)
+                if M["m00"] != 0 and box_scale != 1.0:
+                    cX, cY = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+                    refined = ((target_poly - [cX, cY]) * box_scale + [cX, cY]).astype(np.int32)
+                else: 
+                    refined = target_poly
+                
+                cv2.fillPoly(overlay, [refined], color_bgr)
+                cv2.polylines(canvas, [refined], True, color_bgr, border_px)
+            
+            cv2.addWeighted(overlay, fill_opacity, canvas, 1-fill_opacity, 0, canvas)
+            st.image(canvas, use_container_width=True)
+            
+            buf = io.BytesIO()
+            Image.fromarray(canvas).save(buf, format="PNG")
+            st.download_button("⬇️ Download Results", data=buf.getvalue(), file_name=f"sublots_perfect.png", mime="image/png")
+        else:
+            st.warning("No sublots detected. Try lowering Global Sensitivity.")
+            st.image(image, use_container_width=True)
+    
+    # Street Line Debug Visualization
+    if show_street_debug and use_street_suppression:
+        st.markdown("---")
+        st.subheader("🔍 Street Line Detection Debug")
+        
+        debug_canvas = img_np.copy()
+        # Overlay the detected road mask in cyan
+        road_overlay = np.zeros_like(img_np.copy())
+        road_overlay[road_mask] = [0, 255, 255]  # Cyan color
+        cv2.addWeighted(road_overlay, 0.5, debug_canvas, 1.0, 0, debug_canvas)
+        
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.markdown("**Detected Street/Road Mask (Cyan)**")
+            st.image(debug_canvas, use_container_width=True)
+        
+        with col_d2:
+            st.markdown("**Pure Street Mask**")
+            # Show the mask in black and white
+            street_viz = np.zeros((h_img, w_img, 3), dtype=np.uint8)
+            street_viz[road_mask] = 255
+            st.image(street_viz, use_container_width=True)
+    
+    # Before/After Comparison Visualization
+    if show_comparison:
+        st.markdown("---")
+        st.subheader("🔄 Before/After Comparison")
+        st.info(f"**Before** (No Street Suppression): {len(polygons_before)} sublots | **After** (With Street Suppression): {len(polygons)} sublots")
+        
+        # Helper function to render polygons
+        def render_polygons(poly_list, img_base):
+            canvas = img_base.copy()
+            overlay = img_base.copy()
+            colors = [(79, 172, 254), (0, 242, 254), (74, 194, 154), (180, 236, 81), (247, 249, 151), (238, 156, 167)]
+            
+            for idx, poly in enumerate(poly_list):
+                color = colors[idx % len(colors)]
+                color_bgr = (color[2], color[1], color[0])
+                
+                # REFINEMENT & SMOOTHING
+                if smooth_poly > 0:
+                    epsilon = 0.0005 * smooth_poly * cv2.arcLength(poly, True)
+                    poly = cv2.approxPolyDP(poly, epsilon, True)
+                
+                target_poly = poly
+                
+                M = cv2.moments(target_poly)
+                if M["m00"] != 0 and box_scale != 1.0:
+                    cX, cY = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+                    refined = ((target_poly - [cX, cY]) * box_scale + [cX, cY]).astype(np.int32)
+                else: 
+                    refined = target_poly
+                
+                cv2.fillPoly(overlay, [refined], color_bgr)
+                cv2.polylines(canvas, [refined], True, color_bgr, border_px)
+            
+            cv2.addWeighted(overlay, fill_opacity, canvas, 1-fill_opacity, 0, canvas)
+            return canvas
+        
+        col_comp1, col_comp2 = st.columns(2)
+        with col_comp1:
+            st.markdown("**🔴 BEFORE: Without Street Lines**")
+            before_canvas = render_polygons(polygons_before, img_np)
+            st.image(before_canvas, use_container_width=True)
+        
+        with col_comp2:
+            st.markdown("**🟢 AFTER: With Street Line Suppression**")
+            after_canvas = render_polygons(polygons, img_np)
+            st.image(after_canvas, use_container_width=True)
+
 
 
 # Footer
-st.sidebar.markdown("---")
-st.sidebar.markdown("### ℹ️ About")
-st.sidebar.info(
-    "This application uses YOLOv11-SEG model to detect sublots in field images. "
-    "Upload your trained model and images to get started."
-)
+st.markdown("---")
+st.markdown("<div style='text-align: center; opacity: 0.5;'>Sublot Intelligence Suite v4.5 | Optimized for Edge Detection</div>", unsafe_allow_html=True)
