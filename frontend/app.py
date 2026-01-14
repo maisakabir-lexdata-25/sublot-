@@ -18,17 +18,12 @@ try:
     import torch.nn as nn
     # Add project root to sys.path to allow importing from backend
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from backend.utils import post_process
     from backend.utils.post_process import (
         detect_roads, subtract_roads, get_tiles_metadata, 
         is_centroid_in_center, split_merged_mask_watershed, 
         is_rectangular, non_max_suppression_shapely, is_on_border,
         refine_mask_to_content, is_in_corner
     )
-    # Force reload to get latest changes
-    import importlib
-    importlib.reload(post_process)
-    from backend.utils.post_process import is_in_corner  # Re-import after reload
     
     # List of classes to allow for secure loading
     safe_classes = [
